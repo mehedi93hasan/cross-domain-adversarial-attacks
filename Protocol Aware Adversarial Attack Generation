@@ -1,756 +1,524 @@
 import numpy as np
 import pandas as pd
-import tensorflow as tf
-from tensorflow.keras.models import Sequential, Model
-from tensorflow.keras.layers import Dense, Input, Reshape
-from tensorflow.keras.optimizers import Adam
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout
+from tensorflow.keras.optimizers import Adam
 import os
 import json
-import matplotlib.pyplot as plt
-from tqdm import tqdm
 
-class CANDeepPackGen:
+class ProtocolConstraints:
     """
-    Implementation of CAN-Deep PackGen algorithm from the paper.
-    
-    This algorithm transforms adversarial network features into protocol-compliant
-    CAN frames that preserve adversarial properties while meeting CAN constraints.
+    Class to define and enforce protocol-specific constraints for different dataset types
+    as described in the paper's Protocol-Aware Adversarial Attack Generation section.
     """
     
-    def __init__(self, can_template=None, optimizer_lr=0.001, constraint_weight=0.5):
+    def __init__(self, dataset_type='network'):
         """
-        Initialize the CAN-Deep PackGen algorithm.
+        Initialize protocol constraints for the specified dataset type.
         
         Parameters:
         -----------
-        can_template : dict or None, default=None
-            Template for mapping network features to CAN fields
-        optimizer_lr : float, default=0.001
-            Learning rate for the optimizer
-        constraint_weight : float, default=0.5
-            Weight for constraint loss term (λ in the paper)
+        dataset_type : str, default='network'
+            Type of dataset ('network', 'can', 'v2x'). 
+            This determines which constraints will be applied.
         """
-        self.can_template = can_template or self._default_can_template()
-        self.optimizer_lr = optimizer_lr
-        self.constraint_weight = constraint_weight
-        self.model = None
-        self.scaler = StandardScaler()
+        self.dataset_type = dataset_type.lower()
         
-    def _default_can_template(self):
+        # Load default constraints
+        self.constraints = self._get_default_constraints()
+    
+    def _get_default_constraints(self):
         """
-        Create a default CAN frame template.
+        Get default constraints for the specified dataset type.
         
         Returns:
         --------
-        template : dict
-            Default template for mapping network features to CAN fields
+        constraints : dict
+            Dictionary with feature constraints
         """
-        return {
-            'arbitration_id': {'range': (0, 0x7FF), 'bits': 11, 'source_range': (0, 11)},
-            'data_length_code': {'range': (0, 8), 'bits': 4, 'source_range': (11, 15)},
-            'payload': {'range': (0, 255), 'bytes': 8, 'source_range': (16, 80)},
-            'timestamp': {'min': 0, 'source_range': (80, 88)},
-            'checksum': {'special': 'calculated', 'source_range': None},
-        }
+        if self.dataset_type == 'network':
+            # Network traffic constraints (e.g., for KDDCup99, UNSW-NB15)
+            return {
+                'port': {'min': 0, 'max': 65535},  # Valid port ranges
+                'duration': {'min': 0},             # Non-negative duration
+                'bytes': {'min': 0},                # Non-negative byte count
+                'packets': {'min': 0, 'integer': True},  # Packets must be non-negative integers
+                'flags': {'categorical': True, 'values': ['S', 'SF', 'F', 'R', 'P', 'RSTO', 'RSTR', 'RSTOS0', 'OTH']},
+                'protocol_type': {'categorical': True, 'values': ['tcp', 'udp', 'icmp']},
+                'checksum': {'special': 'checksum'},  # Special handling for checksums
+            }
+        elif self.dataset_type == 'can':
+            # CAN bus constraints (e.g., for CICIoV2024)
+            return {
+                'Arbitration_ID': {'min': 0, 'max': 0x7FF, 'integer': True},  # 11-bit arbitration ID
+                'Data_Length_Code': {'min': 0, 'max': 8, 'integer': True},    # 0-8 bytes
+                'Payload_Byte': {'min': 0, 'max': 255, 'integer': True},      # 0-255 for each byte
+                'Timestamp_Interval': {'min': 0},                              # Non-negative time
+                'Message_Frequency': {'min': 0},                               # Non-negative frequency
+                'Signal_Value': {'special': 'signal'},                         # Special handling for signals
+                'Bus_Load': {'min': 0, 'max': 100},                            # 0-100% bus load
+            }
+        else:  # v2x or other
+            # Default constraints for V2X (combination of network and CAN)
+            return {
+                # Network constraints
+                'port': {'min': 0, 'max': 65535},
+                'duration': {'min': 0},
+                'bytes': {'min': 0},
+                # CAN constraints
+                'Arbitration_ID': {'min': 0, 'max': 0x7FF, 'integer': True},
+                'Data_Length_Code': {'min': 0, 'max': 8, 'integer': True},
+                'Timestamp_Interval': {'min': 0},
+            }
     
-    def build_model(self, input_dim, output_dim=74):
+    def load_constraints_from_file(self, file_path):
         """
-        Build the transformation model.
+        Load constraints from a JSON file.
         
         Parameters:
         -----------
-        input_dim : int
-            Number of input features
-        output_dim : int, default=74
-            Number of output features (for CAN frame)
-            
-        Returns:
-        --------
-        model : tf.keras.Model
-            The built model
-        """
-        # Model that transforms network features to CAN frame representation
-        inputs = Input(shape=(input_dim,))
-        x = Dense(128, activation='relu')(inputs)
-        x = Dense(256, activation='relu')(x)
-        x = Dense(128, activation='relu')(x)
-        outputs = Dense(output_dim, activation='sigmoid')(x)
-        
-        model = Model(inputs=inputs, outputs=outputs)
-        model.compile(optimizer=Adam(self.optimizer_lr), loss='binary_crossentropy')
-        
-        self.model = model
-        return model
-    
-    def quantize_to_can_fields(self, transformed_values):
-        """
-        Quantize transformed values to valid CAN frame fields.
-        
-        Parameters:
-        -----------
-        transformed_values : array-like
-            Values from the transformation model
-            
-        Returns:
-        --------
-        can_frame : dict
-            CAN frame with valid fields
-        """
-        can_frame = {}
-        
-        # Extract values based on template mapping
-        for field, config in self.can_template.items():
-            source_range = config['source_range']
-            
-            if source_range is None:
-                continue
-                
-            start, end = source_range
-            field_values = transformed_values[start:end]
-            
-            if field == 'arbitration_id':
-                # Convert to 11-bit arbitration ID
-                min_val, max_val = config['range']
-                arb_id = int(np.sum(field_values * (2 ** np.arange(len(field_values)))))
-                arb_id = min(max(arb_id, min_val), max_val)
-                can_frame[field] = arb_id
-                
-            elif field == 'data_length_code':
-                # Convert to DLC (0-8)
-                min_val, max_val = config['range']
-                dlc = int(np.sum(field_values * (2 ** np.arange(len(field_values)))))
-                dlc = min(max(dlc, min_val), max_val)
-                can_frame[field] = dlc
-                
-            elif field == 'payload':
-                # Convert to payload bytes (8 bytes, each 0-255)
-                payload = []
-                bytes_count = config['bytes']
-                bits_per_byte = 8
-                
-                for i in range(bytes_count):
-                    start_bit = i * bits_per_byte
-                    end_bit = start_bit + bits_per_byte
-                    byte_bits = field_values[start_bit:end_bit]
-                    byte_value = int(np.sum(byte_bits * (2 ** np.arange(len(byte_bits)))))
-                    payload.append(min(max(byte_value, 0), 255))
-                
-                can_frame[field] = payload
-                
-            elif field == 'timestamp':
-                # Convert to timestamp (non-negative)
-                timestamp_val = np.sum(field_values * (2 ** np.arange(len(field_values))))
-                can_frame[field] = max(timestamp_val, 0)
-        
-        # Calculate checksum if needed
-        if 'checksum' in self.can_template and self.can_template['checksum']['special'] == 'calculated':
-            can_frame['checksum'] = self._calculate_checksum(can_frame)
-        
-        return can_frame
-    
-    def _calculate_checksum(self, can_frame):
-        """
-        Calculate CAN frame checksum.
-        
-        Parameters:
-        -----------
-        can_frame : dict
-            CAN frame fields
-            
-        Returns:
-        --------
-        checksum : int
-            Calculated checksum
-        """
-        # Simple XOR checksum implementation (can be replaced with CAN-specific algorithm)
-        checksum = 0
-        
-        # Include arbitration ID in checksum
-        checksum ^= can_frame['arbitration_id'] & 0xFF
-        checksum ^= (can_frame['arbitration_id'] >> 8) & 0xFF
-        
-        # Include DLC in checksum
-        checksum ^= can_frame['data_length_code'] & 0xFF
-        
-        # Include payload in checksum
-        for byte in can_frame['payload']:
-            checksum ^= byte & 0xFF
-        
-        return checksum & 0xFF  # 8-bit checksum
-    
-    def validate_timing_constraints(self, can_frames):
-        """
-        Validate and adjust timing constraints for a sequence of CAN frames.
-        
-        Parameters:
-        -----------
-        can_frames : list
-            List of CAN frames
-            
-        Returns:
-        --------
-        valid_frames : list
-            CAN frames with valid timing
-        """
-        valid_frames = []
-        last_timestamp = 0
-        
-        for frame in can_frames:
-            # Ensure minimum inter-frame spacing (10 microseconds)
-            min_spacing = 0.01  # milliseconds
-            if frame['timestamp'] < last_timestamp + min_spacing:
-                frame['timestamp'] = last_timestamp + min_spacing
-            
-            last_timestamp = frame['timestamp']
-            valid_frames.append(frame)
-        
-        return valid_frames
-    
-    def can_constraint_loss(self, frames):
-        """
-        Calculate constraint violation loss for CAN frames.
-        
-        Parameters:
-        -----------
-        frames : list
-            List of CAN frames
-            
-        Returns:
-        --------
-        loss : float
-            Constraint violation loss
-        """
-        loss = 0
-        
-        for frame in frames:
-            # Check arbitration ID constraint
-            arb_config = self.can_template['arbitration_id']
-            min_val, max_val = arb_config['range']
-            if frame['arbitration_id'] < min_val or frame['arbitration_id'] > max_val:
-                loss += abs(frame['arbitration_id'] - min(max(frame['arbitration_id'], min_val), max_val))
-            
-            # Check DLC constraint
-            dlc_config = self.can_template['data_length_code']
-            min_val, max_val = dlc_config['range']
-            if frame['data_length_code'] < min_val or frame['data_length_code'] > max_val:
-                loss += abs(frame['data_length_code'] - min(max(frame['data_length_code'], min_val), max_val))
-            
-            # Check payload constraints
-            for byte in frame['payload']:
-                if byte < 0 or byte > 255:
-                    loss += abs(byte - min(max(byte, 0), 255))
-            
-            # Check timestamp constraint
-            if frame['timestamp'] < 0:
-                loss += abs(frame['timestamp'])
-        
-        return loss
-    
-    def adversarial_loss(self, frames, ids_model, benign_label=0):
-        """
-        Calculate adversarial loss (misclassification objective).
-        
-        Parameters:
-        -----------
-        frames : list
-            List of CAN frames
-        ids_model : object
-            IDS model to evade
-        benign_label : int, default=0
-            Label for benign traffic
-            
-        Returns:
-        --------
-        loss : float
-            Adversarial loss
-        """
-        # Convert frames to feature representation for IDS model
-        features = self.frames_to_features(frames)
-        
-        # Get prediction probabilities
-        probs = ids_model.predict_proba(features)
-        
-        # Calculate cross-entropy loss for misclassification as benign
-        loss = -np.mean(np.log(probs[:, benign_label] + 1e-10))
-        
-        return loss
-    
-    def frames_to_features(self, frames):
-        """
-        Convert CAN frames to feature representation for IDS model.
-        
-        Parameters:
-        -----------
-        frames : list
-            List of CAN frames
-            
-        Returns:
-        --------
-        features : array-like
-            Feature representation
-        """
-        features = []
-        
-        for frame in frames:
-            # Example feature extraction (customize based on your IDS model)
-            feature_vector = [
-                frame['arbitration_id'],
-                frame['data_length_code'],
-                *frame['payload'],
-                frame['timestamp'],
-                frame['checksum']
-            ]
-            features.append(feature_vector)
-        
-        return np.array(features)
-    
-    def optimize_adversarial_frames(self, network_adv_samples, ids_model, iterations=100):
-        """
-        Optimize CAN frames to maintain adversarial properties while satisfying constraints.
-        
-        Parameters:
-        -----------
-        network_adv_samples : array-like
-            Adversarial network samples to translate
-        ids_model : object
-            IDS model to evade
-        iterations : int, default=100
-            Number of optimization iterations
-            
-        Returns:
-        --------
-        optimized_frames : list
-            Optimized CAN frames
-        """
-        # Initial transformation
-        frames = []
-        for sample in network_adv_samples:
-            # Transform network features to CAN frame representation
-            transformed = self.model.predict(sample.reshape(1, -1))[0]
-            frame = self.quantize_to_can_fields(transformed)
-            frames.append(frame)
-        
-        # Optimize frames
-        for _ in tqdm(range(iterations), desc="Optimizing CAN frames"):
-            # Calculate total loss
-            adv_loss = self.adversarial_loss(frames, ids_model)
-            constraint_loss = self.can_constraint_loss(frames)
-            total_loss = adv_loss + self.constraint_weight * constraint_loss
-            
-            # Update frames (simplified gradient-based approach)
-            # In a real implementation, you would compute gradients and update more accurately
-            frames = self._update_frames(frames, ids_model)
-        
-        # Final validation of timing constraints
-        optimized_frames = self.validate_timing_constraints(frames)
-        
-        return optimized_frames
-    
-    def _update_frames(self, frames, ids_model):
-        """
-        Update frames based on loss gradients (simplified implementation).
-        
-        Parameters:
-        -----------
-        frames : list
-            List of CAN frames
-        ids_model : object
-            IDS model to evade
-            
-        Returns:
-        --------
-        updated_frames : list
-            Updated frames
-        """
-        # This is a simplified implementation; a full implementation would compute 
-        # proper gradients and update more accurately
-        updated_frames = []
-        
-        for frame in frames:
-            # Create multiple perturbed versions and select the best one
-            candidates = []
-            for _ in range(10):
-                perturbed = self._perturb_frame(frame.copy())
-                candidates.append(perturbed)
-            
-            # Convert candidates to features
-            candidate_features = self.frames_to_features(candidates)
-            
-            # Get benign probabilities
-            probs = ids_model.predict_proba(candidate_features)[:, 0]
-            
-            # Select the best candidate (highest benign probability)
-            best_idx = np.argmax(probs)
-            updated_frames.append(candidates[best_idx])
-        
-        return updated_frames
-    
-    def _perturb_frame(self, frame):
-        """
-        Apply small perturbation to CAN frame.
-        
-        Parameters:
-        -----------
-        frame : dict
-            CAN frame
-            
-        Returns:
-        --------
-        perturbed_frame : dict
-            Perturbed CAN frame
-        """
-        # Randomly perturb fields with small changes
-        if np.random.random() < 0.2:
-            # Perturb arbitration ID
-            delta = np.random.randint(-5, 6)
-            frame['arbitration_id'] = min(max(frame['arbitration_id'] + delta, 0), 0x7FF)
-        
-        if np.random.random() < 0.1:
-            # Perturb DLC
-            delta = np.random.randint(-1, 2)
-            frame['data_length_code'] = min(max(frame['data_length_code'] + delta, 0), 8)
-        
-        # Perturb payload bytes
-        for i in range(len(frame['payload'])):
-            if np.random.random() < 0.2:
-                delta = np.random.randint(-10, 11)
-                frame['payload'][i] = min(max(frame['payload'][i] + delta, 0), 255)
-        
-        # Recalculate checksum
-        frame['checksum'] = self._calculate_checksum(frame)
-        
-        return frame
-    
-    def translate_network_to_can(self, network_adv_samples, ids_model=None):
-        """
-        Translate adversarial network samples to CAN frames.
-        
-        Parameters:
-        -----------
-        network_adv_samples : array-like
-            Adversarial network samples
-        ids_model : object or None, default=None
-            IDS model for adversarial optimization (optional)
-            
-        Returns:
-        --------
-        can_frames : list
-            Translated CAN frames
-        """
-        # Scale the input features if necessary
-        scaled_samples = self.scaler.transform(network_adv_samples)
-        
-        # If model not built yet, build it
-        if self.model is None:
-            self.build_model(scaled_samples.shape[1])
-        
-        # Initial transformation
-        frames = []
-        for sample in scaled_samples:
-            # Transform network features to CAN frame representation
-            transformed = self.model.predict(sample.reshape(1, -1))[0]
-            frame = self.quantize_to_can_fields(transformed)
-            frames.append(frame)
-        
-        # If IDS model provided, optimize the frames
-        if ids_model is not None:
-            frames = self.optimize_adversarial_frames(scaled_samples, ids_model)
-        
-        # Final validation of timing constraints
-        valid_frames = self.validate_timing_constraints(frames)
-        
-        return valid_frames
-    
-    def train(self, network_samples, can_samples, epochs=50, batch_size=32):
-        """
-        Train the translation model between network and CAN domains.
-        
-        Parameters:
-        -----------
-        network_samples : array-like
-            Network domain samples
-        can_samples : array-like
-            CAN domain samples
-        epochs : int, default=50
-            Number of training epochs
-        batch_size : int, default=32
-            Batch size for training
-            
-        Returns:
-        --------
-        history : dict
-            Training history
-        """
-        print("Training CAN-Deep PackGen model...")
-        
-        # Scale network samples
-        scaled_network = self.scaler.fit_transform(network_samples)
-        
-        # Process CAN samples to binary format
-        processed_can = self._preprocess_can_samples(can_samples)
-        
-        # Build model if not built yet
-        if self.model is None:
-            self.build_model(scaled_network.shape[1], processed_can.shape[1])
-        
-        # Train the model
-        history = self.model.fit(
-            scaled_network, processed_can,
-            epochs=epochs,
-            batch_size=batch_size,
-            validation_split=0.2,
-            verbose=1
-        )
-        
-        return history
-    
-    def _preprocess_can_samples(self, can_samples):
-        """
-        Preprocess CAN samples to binary format.
-        
-        Parameters:
-        -----------
-        can_samples : array-like
-            CAN samples
-            
-        Returns:
-        --------
-        processed : array-like
-            Processed binary representation
-        """
-        # This is a simplified implementation that assumes can_samples are already in a suitable format
-        # In a real implementation, this would convert CAN frames to binary representations
-        return can_samples
-    
-    def save_model(self, model_path):
-        """
-        Save the trained model.
-        
-        Parameters:
-        -----------
-        model_path : str
-            Path to save the model
-            
-        Returns:
-        --------
-        model_path : str
-            Path to the saved model
-        """
-        if self.model is None:
-            raise ValueError("Model not trained yet")
-        
-        # Create directory if doesn't exist
-        os.makedirs(os.path.dirname(model_path), exist_ok=True)
-        
-        # Save the model
-        self.model.save(model_path)
-        
-        # Save the scaler
-        scaler_path = os.path.join(os.path.dirname(model_path), "scaler.pkl")
-        import joblib
-        joblib.dump(self.scaler, scaler_path)
-        
-        print(f"Model saved to {model_path}")
-        print(f"Scaler saved to {scaler_path}")
-        
-        return model_path
-    
-    def load_model(self, model_path):
-        """
-        Load a trained model.
-        
-        Parameters:
-        -----------
-        model_path : str
-            Path to the saved model
+        file_path : str
+            Path to the JSON constraints file
             
         Returns:
         --------
         self : object
-            The loaded model
         """
-        # Load the model
-        self.model = tf.keras.models.load_model(model_path)
-        
-        # Load the scaler
-        scaler_path = os.path.join(os.path.dirname(model_path), "scaler.pkl")
-        import joblib
-        self.scaler = joblib.load(scaler_path)
-        
-        print(f"Model loaded from {model_path}")
-        print(f"Scaler loaded from {scaler_path}")
-        
+        with open(file_path, 'r') as f:
+            self.constraints = json.load(f)
         return self
     
-    def save_frames_to_csv(self, frames, output_file):
+    def save_constraints_to_file(self, file_path):
         """
-        Save CAN frames to CSV file.
+        Save current constraints to a JSON file.
         
         Parameters:
         -----------
-        frames : list
-            List of CAN frames
-        output_file : str
-            Path to output CSV file
+        file_path : str
+            Path to save the JSON constraints file
             
         Returns:
         --------
-        output_file : str
+        file_path : str
             Path to the saved file
         """
-        # Create directory if needed
-        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
         
-        # Convert frames to DataFrame format
-        rows = []
-        for frame in frames:
-            row = {
-                'arbitration_id': frame['arbitration_id'],
-                'data_length_code': frame['data_length_code'],
-                'timestamp': frame['timestamp'],
-                'checksum': frame['checksum']
-            }
+        with open(file_path, 'w') as f:
+            json.dump(self.constraints, f, indent=4)
+        
+        return file_path
+    
+    def apply(self, feature_values, feature_names):
+        """
+        Apply protocol constraints to feature values.
+        
+        Parameters:
+        -----------
+        feature_values : array-like
+            Feature values to constrain
+        feature_names : list
+            Names of the features corresponding to the values
             
-            # Add payload bytes
-            for i, byte in enumerate(frame['payload']):
-                row[f'payload_byte_{i}'] = byte
+        Returns:
+        --------
+        constrained_values : array-like
+            Feature values after applying constraints
+        """
+        constrained_values = feature_values.copy()
+        
+        for i, feature in enumerate(feature_names):
+            # Find matching constraint based on feature name
+            constraint = None
+            for pattern, const in self.constraints.items():
+                if pattern in feature.lower():
+                    constraint = const
+                    break
             
-            rows.append(row)
+            if constraint:
+                # Apply min/max constraints
+                if 'min' in constraint:
+                    constrained_values[i] = max(constrained_values[i], constraint['min'])
+                
+                if 'max' in constraint:
+                    constrained_values[i] = min(constrained_values[i], constraint['max'])
+                
+                # Apply integer constraints
+                if constraint.get('integer', False):
+                    constrained_values[i] = int(round(constrained_values[i]))
+                
+                # Special handling for categorical features
+                if constraint.get('categorical', False) and 'values' in constraint:
+                    # This is simplified; real implementation would handle one-hot encoding
+                    pass
+                
+                # Special handling for checksums and other protocol-specific fields
+                if 'special' in constraint:
+                    # Placeholder for special handling logic
+                    pass
         
-        # Create DataFrame and save to CSV
-        df = pd.DataFrame(rows)
-        df.to_csv(output_file, index=False)
-        
-        print(f"CAN frames saved to {output_file}")
-        
-        return output_file
+        return constrained_values
 
 
-def process_csv_with_can_deep_packgen(network_csv, output_dir='./can_deep_packgen_output', 
-                                     train_mode=False, can_csv=None, ids_model=None):
+class VXProjectedGradientDescent:
     """
-    Process a CSV file with network adversarial examples using CAN-Deep PackGen.
+    Implementation of the V2X-Aware Projected Gradient Descent (VX-PGD) algorithm from the paper.
+    
+    This class implements Algorithm 2 from the paper, generating adversarial examples
+    while respecting protocol-specific constraints.
+    """
+    
+    def __init__(self, model, feature_names, dataset_type='network', epsilon=0.1, alpha=0.01, 
+                 iterations=10, protocol_constraints=None):
+        """
+        Initialize the VX-PGD algorithm.
+        
+        Parameters:
+        -----------
+        model : object
+            Classification model with predict and predict_proba methods
+        feature_names : list
+            Names of the features in the dataset
+        dataset_type : str, default='network'
+            Type of dataset ('network', 'can', 'v2x')
+        epsilon : float, default=0.1
+            Maximum perturbation (L∞ norm)
+        alpha : float, default=0.01
+            Step size for gradient updates
+        iterations : int, default=10
+            Number of iterations
+        protocol_constraints : ProtocolConstraints or None, default=None
+            Protocol constraints object. If None, create a new one based on dataset_type.
+        """
+        self.model = model
+        self.feature_names = feature_names
+        self.epsilon = epsilon
+        self.alpha = alpha
+        self.iterations = iterations
+        
+        # Initialize protocol constraints
+        if protocol_constraints is None:
+            self.protocol_constraints = ProtocolConstraints(dataset_type)
+        else:
+            self.protocol_constraints = protocol_constraints
+    
+    def generate(self, X, y, targeted=False, target_class=None):
+        """
+        Generate adversarial examples using the VX-PGD algorithm.
+        
+        Parameters:
+        -----------
+        X : array-like
+            Original input samples
+        y : array-like
+            True labels
+        targeted : bool, default=False
+            Whether to perform a targeted attack
+        target_class : int or None, default=None
+            Target class for targeted attacks. If None, select the least-likely class.
+            
+        Returns:
+        --------
+        X_adv : array-like
+            Adversarial examples
+        success_rate : float
+            Percentage of successful adversarial examples
+        """
+        # Ensure inputs are numpy arrays
+        X = np.array(X)
+        y = np.array(y)
+        
+        # Initialize adversarial examples with originals
+        X_adv = X.copy()
+        
+        # Convert model to TensorFlow if it's not already
+        tf_model = self._convert_to_tf_model(self.model, X.shape[1])
+        
+        # Track successful attacks
+        success = np.zeros(X.shape[0], dtype=bool)
+        
+        for i in range(X.shape[0]):
+            # Skip already successful attacks
+            if success[i]:
+                continue
+            
+            x = X[i:i+1]  # Get single sample
+            y_true = y[i]
+            
+            # For targeted attacks, determine target class
+            if targeted:
+                if target_class is not None:
+                    y_target = target_class
+                else:
+                    # Use least likely class as target
+                    probs = self.model.predict_proba(x)[0]
+                    y_target = np.argmin(probs)
+            else:
+                y_target = y_true  # For untargeted attacks, we just use the true class
+            
+            # Apply VX-PGD algorithm (Algorithm 2 from the paper)
+            x_adv = self._vx_pgd(tf_model, x, y_target, targeted)
+            
+            X_adv[i] = x_adv
+            
+            # Check if attack was successful
+            y_pred = self.model.predict(x_adv.reshape(1, -1))[0]
+            success[i] = (y_pred != y_true) if not targeted else (y_pred == y_target)
+        
+        # Calculate success rate
+        success_rate = np.mean(success) * 100
+        print(f"Attack success rate: {success_rate:.2f}%")
+        
+        return X_adv, success_rate
+    
+    def _vx_pgd(self, model, x, y_target, targeted):
+        """
+        Core implementation of the VX-PGD algorithm (Algorithm 2).
+        
+        Parameters:
+        -----------
+        model : tf.keras.Model
+            TensorFlow model for gradient calculation
+        x : array-like
+            Original input sample
+        y_target : int
+            Target class
+        targeted : bool
+            Whether this is a targeted attack
+            
+        Returns:
+        --------
+        x_adv : array-like
+            Adversarial example
+        """
+        # Convert to TensorFlow tensor
+        x_tensor = tf.convert_to_tensor(x, dtype=tf.float32)
+        y_tensor = tf.convert_to_tensor([y_target], dtype=tf.int32)
+        
+        # Initialize adversarial example
+        x_adv = x.copy()
+        
+        for t in range(self.iterations):
+            # Step 5: Compute loss gradient
+            with tf.GradientTape() as tape:
+                tape.watch(x_tensor)
+                logits = model(x_tensor)
+                
+                if targeted:
+                    # For targeted attacks, minimize loss for target class
+                    loss = tf.keras.losses.sparse_categorical_crossentropy(y_tensor, logits)
+                else:
+                    # For untargeted attacks, maximize loss for true class
+                    loss = -tf.keras.losses.sparse_categorical_crossentropy(y_tensor, logits)
+            
+            # Get gradient of loss with respect to input
+            gradient = tape.gradient(loss, x_tensor)
+            
+            # Step 6: Update perturbation using sign of gradient
+            gradient_sign = tf.sign(gradient).numpy()
+            x_adv = x_adv + self.alpha * gradient_sign[0]
+            
+            # Step 7: Project to L∞-ball (clip to epsilon range around original)
+            x_adv = np.clip(x_adv, x - self.epsilon, x + self.epsilon)
+            
+            # Step 8: Enforce CAN constraints (Protocol-aware projection)
+            x_adv = self.protocol_constraints.apply(x_adv[0], self.feature_names)
+            x_adv = x_adv.reshape(1, -1)
+            
+            # Update tensor for next iteration
+            x_tensor = tf.convert_to_tensor(x_adv, dtype=tf.float32)
+        
+        return x_adv[0]
+    
+    def _convert_to_tf_model(self, sklearn_model, input_dim):
+        """
+        Convert a scikit-learn model to a TensorFlow model for gradient computation.
+        
+        Parameters:
+        -----------
+        sklearn_model : object
+            Scikit-learn model
+        input_dim : int
+            Input dimension
+            
+        Returns:
+        --------
+        tf_model : tf.keras.Model
+            TensorFlow model approximating the sklearn model
+        """
+        # This is a simplified approximation - in practice, you'd need a more accurate conversion
+        if hasattr(sklearn_model, 'n_classes_'):
+            n_classes = sklearn_model.n_classes_
+        else:
+            n_classes = len(np.unique(sklearn_model.predict(np.random.random((10, input_dim)))))
+        
+        # Create a simple neural network as a substitute model
+        model = Sequential([
+            Dense(64, activation='relu', input_shape=(input_dim,)),
+            Dropout(0.2),
+            Dense(32, activation='relu'),
+            Dropout(0.2),
+            Dense(n_classes, activation='softmax')
+        ])
+        
+        model.compile(optimizer=Adam(0.001), loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+        
+        return model
+
+
+def generate_adversarial_examples(input_file, output_dir='./adversarial_examples', 
+                                 target_column='label', dataset_type='network',
+                                 epsilon=0.1, alpha=0.01, iterations=10):
+    """
+    Generate adversarial examples from a dataset using VX-PGD algorithm and save to CSV.
     
     Parameters:
     -----------
-    network_csv : str
-        Path to CSV file with network adversarial examples
-    output_dir : str, default='./can_deep_packgen_output'
-        Directory to save outputs
-    train_mode : bool, default=False
-        Whether to train the model (requires can_csv)
-    can_csv : str or None, default=None
-        Path to CSV file with CAN samples (required if train_mode=True)
-    ids_model : object or None, default=None
-        IDS model for adversarial optimization (optional)
+    input_file : str
+        Path to the input CSV file with selected features
+    output_dir : str, default='./adversarial_examples'
+        Directory to save output files
+    target_column : str, default='label'
+        Name of the target column
+    dataset_type : str, default='network'
+        Type of dataset ('network', 'can', 'v2x')
+    epsilon : float, default=0.1
+        Maximum perturbation
+    alpha : float, default=0.01
+        Step size
+    iterations : int, default=10
+        Number of iterations
         
     Returns:
     --------
     results : dict
         Dictionary with paths to output files
     """
-    print(f"Processing network samples from {network_csv}...")
+    print(f"Loading data from {input_file}...")
+    data = pd.read_csv(input_file)
     
-    # Create output directory
+    # Extract features and target
+    X = data.drop(columns=[target_column])
+    y = data[target_column]
+    feature_names = X.columns.tolist()
+    
+    print(f"Dataset shape: {X.shape}")
+    print(f"Number of classes: {len(np.unique(y))}")
+    
+    # Split data
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42, stratify=y)
+    
+    print("Training a classifier...")
+    classifier = RandomForestClassifier(n_estimators=100, random_state=42)
+    classifier.fit(X_train, y_train)
+    
+    # Evaluate classifier
+    test_acc = classifier.score(X_test, y_test)
+    print(f"Classifier accuracy on test set: {test_acc:.4f}")
+    
+    # Define protocol constraints
+    constraints = ProtocolConstraints(dataset_type)
+    
+    # Save constraints for reference
     os.makedirs(output_dir, exist_ok=True)
+    constraints_file = os.path.join(output_dir, 'protocol_constraints.json')
+    constraints.save_constraints_to_file(constraints_file)
     
-    # Load network data
-    network_data = pd.read_csv(network_csv)
+    print(f"\nGenerating adversarial examples using VX-PGD algorithm...")
+    print(f"Parameters: epsilon={epsilon}, alpha={alpha}, iterations={iterations}")
     
-    # Separate features (may need to customize this)
-    if 'label' in network_data.columns:
-        X = network_data.drop(columns=['label'])
-        y = network_data['label']
-    else:
-        X = network_data
-        y = None
+    # Initialize VX-PGD algorithm
+    vx_pgd = VXProjectedGradientDescent(
+        model=classifier,
+        feature_names=feature_names,
+        dataset_type=dataset_type,
+        epsilon=epsilon,
+        alpha=alpha,
+        iterations=iterations,
+        protocol_constraints=constraints
+    )
     
-    # Initialize CAN-Deep PackGen
-    can_deep_packgen = CANDeepPackGen()
+    # Generate adversarial examples
+    X_adv, success_rate = vx_pgd.generate(X_test.values, y_test.values)
     
-    # Train or load the model
-    if train_mode:
-        if can_csv is None:
-            raise ValueError("CAN samples CSV file required for training mode")
-        
-        # Load CAN data
-        print(f"Loading CAN samples from {can_csv}...")
-        can_data = pd.read_csv(can_csv)
-        
-        # Preprocess CAN data (may need to customize this)
-        if 'label' in can_data.columns:
-            can_X = can_data.drop(columns=['label'])
-        else:
-            can_X = can_data
-        
-        # Train the model
-        history = can_deep_packgen.train(X.values, can_X.values, epochs=50, batch_size=32)
-        
-        # Save the model
-        model_path = os.path.join(output_dir, "can_deep_packgen_model")
-        can_deep_packgen.save_model(model_path)
-        
-        # Plot training history
-        plt.figure(figsize=(10, 5))
-        plt.plot(history.history['loss'])
-        plt.plot(history.history['val_loss'])
-        plt.title('Model Loss')
-        plt.ylabel('Loss')
-        plt.xlabel('Epoch')
-        plt.legend(['Train', 'Validation'], loc='upper right')
-        plt.savefig(os.path.join(output_dir, "training_history.png"))
+    # Create DataFrame with adversarial examples
+    X_adv_df = pd.DataFrame(X_adv, columns=feature_names)
     
-    else:
-        # Try to load existing model
-        model_path = os.path.join(output_dir, "can_deep_packgen_model")
-        if os.path.exists(model_path):
-            print(f"Loading existing model from {model_path}...")
-            can_deep_packgen.load_model(model_path)
-        else:
-            print("No existing model found. Training a simple model...")
-            # Simple model training without CAN data (less accurate)
-            can_deep_packgen.build_model(X.shape[1])
+    # Add true labels and predicted labels
+    X_adv_df[target_column] = y_test.values
+    X_adv_df['predicted_label'] = classifier.predict(X_adv)
     
-    # Translate network samples to CAN frames
-    print("Translating network samples to CAN frames...")
-    can_frames = can_deep_packgen.translate_network_to_can(X.values, ids_model)
+    # Add a column indicating whether the attack was successful
+    X_adv_df['attack_success'] = X_adv_df[target_column] != X_adv_df['predicted_label']
     
-    # Save CAN frames to CSV
-    output_file = os.path.join(output_dir, "translated_can_frames.csv")
-    can_deep_packgen.save_frames_to_csv(can_frames, output_file)
+    # Save to CSV
+    adv_file = os.path.join(output_dir, 'adversarial_examples.csv')
+    X_adv_df.to_csv(adv_file, index=False)
     
-    # Also save as JSON for detailed inspection
-    json_output = os.path.join(output_dir, "translated_can_frames.json")
-    with open(json_output, 'w') as f:
-        json.dump(can_frames[:10], f, indent=4)  # Save first 10 frames for inspection
+    # Save original test data for comparison
+    original_file = os.path.join(output_dir, 'original_test_samples.csv')
+    test_df = X_test.copy()
+    test_df[target_column] = y_test
+    test_df.to_csv(original_file, index=False)
     
-    print(f"\nTranslation complete!")
-    print(f"Translated {len(can_frames)} network samples to CAN frames")
+    # Save perturbation (difference between original and adversarial)
+    perturbation = X_adv - X_test.values
+    perturbation_df = pd.DataFrame(perturbation, columns=feature_names)
+    perturbation_file = os.path.join(output_dir, 'perturbations.csv')
+    perturbation_df.to_csv(perturbation_file, index=False)
+    
+    # Generate summary
+    summary = {
+        'total_samples': len(X_test),
+        'attack_success_rate': success_rate,
+        'classifier_accuracy': test_acc,
+        'parameters': {
+            'epsilon': epsilon,
+            'alpha': alpha,
+            'iterations': iterations,
+            'dataset_type': dataset_type
+        }
+    }
+    
+    # Save summary
+    summary_file = os.path.join(output_dir, 'attack_summary.json')
+    with open(summary_file, 'w') as f:
+        json.dump(summary, f, indent=4)
+    
+    print(f"\nAdversarial example generation complete!")
     print(f"Results saved to {output_dir}")
     
     return {
-        'can_frames_csv': output_file,
-        'can_frames_json': json_output,
-        'model_path': os.path.join(output_dir, "can_deep_packgen_model") if train_mode else None,
-        'training_history': os.path.join(output_dir, "training_history.png") if train_mode else None
+        'adversarial_examples': adv_file,
+        'original_samples': original_file,
+        'perturbations': perturbation_file,
+        'summary': summary_file,
+        'constraints': constraints_file
     }
 
 
 # Example usage
 if __name__ == "__main__":
-    # Replace with your actual file paths
-    network_csv = "network_adversarial_examples.csv"
+    # Replace with the path to your selected features dataset
+    input_file = "selected_features_dataset.csv"
     
-    # Process in inference mode (without training)
-    results = process_csv_with_can_deep_packgen(
-        network_csv=network_csv,
-        output_dir="./can_deep_packgen_results",
-        train_mode=False
-    )
+    # Set parameters
+    params = {
+        'output_dir': './vxpgd_results',
+        'target_column': 'label',  # Replace with your target column name
+        'dataset_type': 'network',  # 'network', 'can', or 'v2x'
+        'epsilon': 0.1,            # Maximum perturbation
+        'alpha': 0.01,             # Step size
+        'iterations': 10           # Number of iterations
+    }
+    
+    # Generate adversarial examples
+    results = generate_adversarial_examples(input_file, **params)
     
     print("\nOutput files:")
     for key, value in results.items():
-        if value:
-            print(f"  {key}: {value}")
+        print(f"  {key}: {value}")
