@@ -1,0 +1,228 @@
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.ensemble import GradientBoostingClassifier  # Used as XGBoost alternative
+from sklearn.inspection import permutation_importance
+from sklearn.model_selection import train_test_split
+import os
+
+class EnsembleFeatureScoring:
+    """
+    Implementation of the Ensemble Feature Scoring (EFS) mechanism as described in the paper.
+
+    This class implements Algorithm 1 from the paper, training four models (XGBoost, Random Forest,
+    Decision Tree, and KNN) and computing weighted feature importance scores.
+    """
+
+    def __init__(self, top_k=10):
+        """
+        Initialize the EFS algorithm.
+
+        Parameters:
+        -----------
+        top_k : int, default=10
+            Number of top features to select
+        """
+        self.top_k = top_k
+        self.models = {
+            'XGBoost': GradientBoostingClassifier(random_state=42),
+            'RF': RandomForestClassifier(random_state=42),
+            'DT': DecisionTreeClassifier(random_state=42),
+            'KNN': KNeighborsClassifier()
+        }
+        self.accuracies = {}
+        self.feature_importance = {}
+        self.selected_features = None
+
+    def fit(self, X, y):
+        """
+        Fit the EFS algorithm to the data.
+
+        Parameters:
+        -----------
+        X : array-like, shape (n_samples, n_features)
+            The training input samples.
+        y : array-like, shape (n_samples,)
+            The target values.
+
+        Returns:
+        --------
+        self : object
+        """
+        print("Starting Ensemble Feature Scoring algorithm...")
+
+        # Convert X to DataFrame if it's not already
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X, columns=[f'feature_{i}' for i in range(X.shape[1])])
+
+        # Split data for training and evaluation
+        X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+        print(f"Split data: {X_train.shape[0]} training samples, {X_val.shape[0]} validation samples")
+
+        # Step 1-5: Train each model (Algorithm 1, lines 1-5)
+        for name, model in self.models.items():
+            print(f"Training {name} model...")
+            model.fit(X_train, y_train)
+
+            # Calculate accuracy on validation set
+            accuracy = model.score(X_val, y_val)
+            self.accuracies[name] = accuracy
+            print(f"  {name} accuracy: {accuracy:.4f}")
+
+        # Step 6-11: Calculate feature importance for each model (Algorithm 1, lines 6-11)
+        feature_names = X.columns
+        for name, model in self.models.items():
+            print(f"Computing feature importance for {name}...")
+
+            if name in ['XGBoost', 'RF', 'DT']:  # Tree-based models use Gini impurity
+                importances = model.feature_importances_
+                self.feature_importance[name] = dict(zip(feature_names, importances))
+            else:  # KNN uses permutation importance
+                result = permutation_importance(model, X_val, y_val, n_repeats=10, random_state=42)
+                importances = result.importances_mean
+                self.feature_importance[name] = dict(zip(feature_names, importances))
+
+        # Step 12-15: Calculate weighted aggregate score for each feature (Algorithm 1, lines 12-15)
+        print("Calculating aggregate feature scores...")
+
+        # Calculate model weights based on accuracy
+        total_accuracy = sum(self.accuracies.values())
+        weights = {name: acc / total_accuracy for name, acc in self.accuracies.items()}
+        print("Model weights:")
+        for name, weight in weights.items():
+            print(f"  {name}: {weight:.4f}")
+
+        # Calculate aggregate score for each feature
+        total_scores = {}
+        for feature in feature_names:
+            total_score = 0
+            for model_name in self.models.keys():
+                model_weight = weights[model_name]
+                feature_score = self.feature_importance[model_name][feature]
+                total_score += model_weight * feature_score
+            total_scores[feature] = total_score
+
+        # Sort features by importance
+        sorted_features = sorted(total_scores.items(), key=lambda x: x[1], reverse=True)
+
+        # Step 16: Select top-k features (Algorithm 1, line 16)
+        self.selected_features = [feature for feature, score in sorted_features[:self.top_k]]
+        self.feature_scores = pd.DataFrame(sorted_features, columns=['Feature', 'Score'])
+
+        print(f"\nTop {self.top_k} selected features:")
+        for i, feature in enumerate(self.selected_features, 1):
+            score = total_scores[feature]
+            print(f"  {i}. {feature} (Score: {score:.6f})")
+
+        return self
+
+    def get_best_features(self):
+        """
+        Get the list of best features selected by the algorithm.
+        
+        Returns:
+        --------
+        selected_features : list
+            List of the top-k selected features
+        """
+        if self.selected_features is None:
+            raise ValueError("You need to fit the model first!")
+            
+        return self.selected_features
+    
+    def get_feature_scores(self):
+        """
+        Get the feature scores as a DataFrame.
+        
+        Returns:
+        --------
+        feature_scores : pandas.DataFrame
+            DataFrame with feature names and their importance scores
+        """
+        if not hasattr(self, 'feature_scores'):
+            raise ValueError("You need to fit the model first!")
+            
+        return self.feature_scores
+
+
+def find_best_features(input_file, top_k=10, target_column='label'):
+    """
+    Find the best features in a dataset using Ensemble Feature Selection.
+    Simplified function that only returns the list of best features.
+
+    Parameters:
+    -----------
+    input_file : str
+        Path to the input CSV file.
+    top_k : int, default=10
+        Number of top features to select.
+    target_column : str, default='label'
+        Name of the target column in the dataset.
+
+    Returns:
+    --------
+    best_features : list
+        List of the top-k selected features
+    feature_scores: pandas.DataFrame
+        DataFrame with all features and their scores
+    """
+    print(f"Loading dataset from {input_file}...")
+    data = pd.read_csv(input_file)
+
+    print(f"Dataset shape: {data.shape}")
+    print(f"Target column: {target_column}")
+
+    # Extract features and target
+    X = data.drop(columns=[target_column])
+    y = data[target_column]
+
+    print(f"Features shape: {X.shape}")
+    print(f"Unique target classes: {np.unique(y)}")
+
+    # Apply Ensemble Feature Selection
+    efs = EnsembleFeatureScoring(top_k=top_k)
+    efs.fit(X, y)
+
+    # Get the list of best features
+    best_features = efs.get_best_features()
+    feature_scores = efs.get_feature_scores()
+    
+    return best_features, feature_scores
+
+
+# Example usage
+if __name__ == "__main__":
+    # Replace with your actual input file
+    input_file = "[after balance] kddcup99_train.csv"
+
+    # Number of top features to select
+    top_k = 10
+
+    # Find the best features
+    best_features, feature_scores = find_best_features(
+        input_file=input_file,
+        top_k=top_k,
+        target_column="label"  # Replace with your actual target column name
+    )
+
+    print("\n=== BEST FEATURES ===")
+    for i, feature in enumerate(best_features, 1):
+        score = feature_scores[feature_scores['Feature'] == feature]['Score'].values[0]
+        print(f"{i}. {feature} (Score: {score:.6f})")
+        
+    # Save the best features to a file
+    output_dir = "./best_features"
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Save feature scores
+    scores_file = os.path.join(output_dir, 'feature_scores.csv')
+    feature_scores.to_csv(scores_file, index=False)
+    
+    # Save selected features list
+    selected_file = os.path.join(output_dir, 'best_features_list.csv')
+    pd.DataFrame(best_features, columns=['Feature']).to_csv(selected_file, index=False)
+    
+    print(f"\nBest features saved to: {selected_file}")
+    print(f"Feature scores saved to: {scores_file}")
