@@ -1,0 +1,433 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.model_selection import train_test_split
+from imblearn.over_sampling import SMOTE
+import os
+import warnings
+warnings.filterwarnings('ignore')
+
+class DataPreprocessor:
+    """
+    Implementation of the data preprocessing pipeline described in the paper
+    for KDDCup99, UNSW-NB15, and CICIoV2024 datasets.
+
+    This class handles:
+    1. Missing value imputation using median for numerical and mode for categorical data
+    2. Feature normalization (z-score for normal distributions, min-max for skewed)
+    3. Class imbalance correction using SMOTE
+    4. Saving preprocessed data to CSV files
+    """
+
+    def __init__(self, dataset_type):
+        """
+        Initialize the data preprocessor.
+
+        Parameters:
+        -----------
+        dataset_type : str
+            Type of dataset ('kddcup99', 'unsw-nb15', or 'ciciov2024')
+        """
+        self.dataset_type = dataset_type.lower()
+        self.numerical_scaler = None
+        self.skewed_scaler = None
+
+        # Define expected feature counts for validation
+        self.expected_features = {
+            'kddcup99': 41,
+            'unsw-nb15': 49,
+            'ciciov2024': 15
+        }
+
+        # Validate dataset type
+        if self.dataset_type not in self.expected_features:
+            raise ValueError(f"Unsupported dataset type: {dataset_type}. "
+                           f"Supported types: {list(self.expected_features.keys())}")
+
+    def load_data(self, file_path):
+        """
+        Load data from file.
+
+        Parameters:
+        -----------
+        file_path : str
+            Path to the data file
+
+        Returns:
+        --------
+        df : pandas DataFrame
+            The loaded data
+        """
+        print(f"Loading {self.dataset_type} data from {file_path}...")
+
+        # Load data based on file extension
+        if file_path.endswith('.csv'):
+            df = pd.read_csv(file_path)
+        elif file_path.endswith(('.xls', '.xlsx')):
+            df = pd.read_excel(file_path)
+        else:
+            raise ValueError("Unsupported file format. Please provide CSV or Excel file.")
+
+        # Validate number of features
+        expected_count = self.expected_features[self.dataset_type]
+        actual_count = len(df.columns)
+
+        if actual_count != expected_count and actual_count != expected_count + 1:  # +1 for potential class/label column
+            warnings.warn(f"Expected {expected_count} features for {self.dataset_type}, "
+                        f"but found {actual_count}. This might not be a standard {self.dataset_type} dataset.")
+
+        return df
+
+    def identify_feature_types(self, df):
+        """
+        Identify numerical, categorical, and skewed features in the dataset.
+
+        Parameters:
+        -----------
+        df : pandas DataFrame
+            The input data
+
+        Returns:
+        --------
+        feature_types : dict
+            Dictionary with lists of numerical, categorical, and skewed features
+        """
+        # Identify numerical and categorical features
+        numerical_features = df.select_dtypes(include=['int64', 'float64']).columns.tolist()
+        categorical_features = df.select_dtypes(include=['object', 'category']).columns.tolist()
+
+        # Identify skewed numerical features (skewness > 0.5)
+        skewed_features = []
+        normal_features = []
+
+        for feature in numerical_features:
+            skewness = df[feature].skew()
+            if abs(skewness) > 0.5:  # Threshold for considering a feature skewed
+                skewed_features.append(feature)
+            else:
+                normal_features.append(feature)
+
+        return {
+            'numerical': numerical_features,
+            'categorical': categorical_features,
+            'skewed': skewed_features,
+            'normal': normal_features
+        }
+
+    def handle_missing_values(self, df, feature_types):
+        """
+        Fill missing values: numerical with median, categorical with mode.
+
+        Parameters:
+        -----------
+        df : pandas DataFrame
+            The input data
+        feature_types : dict
+            Dictionary with lists of numerical and categorical features
+
+        Returns:
+        --------
+        df : pandas DataFrame
+            Data with missing values filled
+        """
+        print("Handling missing values...")
+
+        # Fill missing values in numerical features with median
+        for feature in feature_types['numerical']:
+            if df[feature].isnull().sum() > 0:
+                median_value = df[feature].median()
+                df[feature] = df[feature].fillna(median_value)
+                print(f"  Filled {df[feature].isnull().sum()} missing values in '{feature}' with median ({median_value})")
+
+        # Fill missing values in categorical features with mode
+        for feature in feature_types['categorical']:
+            if df[feature].isnull().sum() > 0:
+                mode_value = df[feature].mode()[0]
+                df[feature] = df[feature].fillna(mode_value)
+                print(f"  Filled {df[feature].isnull().sum()} missing values in '{feature}' with mode ({mode_value})")
+
+        return df
+
+    def normalize_features(self, df, feature_types, fit=True):
+        """
+        Normalize features: z-score for normal distributions, min-max for skewed.
+
+        Parameters:
+        -----------
+        df : pandas DataFrame
+            The input data
+        feature_types : dict
+            Dictionary with lists of numerical feature types
+        fit : bool, default=True
+            Whether to fit the scalers or use pre-fitted ones
+
+        Returns:
+        --------
+        df : pandas DataFrame
+            Data with normalized features
+        """
+        print("Normalizing features...")
+
+        # Create a copy to avoid modifying the original
+        df_normalized = df.copy()
+
+        # Apply Z-score normalization to normally distributed features
+        if feature_types['normal']:
+            if fit:
+                self.numerical_scaler = StandardScaler()
+                df_normalized[feature_types['normal']] = self.numerical_scaler.fit_transform(
+                    df_normalized[feature_types['normal']])
+            else:
+                if self.numerical_scaler is None:
+                    raise ValueError("Scaler not fitted. Call with fit=True first.")
+                df_normalized[feature_types['normal']] = self.numerical_scaler.transform(
+                    df_normalized[feature_types['normal']])
+
+        # Apply Min-Max scaling to skewed features
+        if feature_types['skewed']:
+            if fit:
+                self.skewed_scaler = MinMaxScaler()
+                df_normalized[feature_types['skewed']] = self.skewed_scaler.fit_transform(
+                    df_normalized[feature_types['skewed']])
+            else:
+                if self.skewed_scaler is None:
+                    raise ValueError("Scaler not fitted. Call with fit=True first.")
+                df_normalized[feature_types['skewed']] = self.skewed_scaler.transform(
+                    df_normalized[feature_types['skewed']])
+
+        return df_normalized
+
+    def encode_categorical(self, df, feature_types):
+        """
+        Encode categorical features using one-hot encoding.
+
+        Parameters:
+        -----------
+        df : pandas DataFrame
+            The input data
+        feature_types : dict
+            Dictionary with lists of categorical features
+
+        Returns:
+        --------
+        df : pandas DataFrame
+            Data with encoded categorical features
+        """
+        if not feature_types['categorical']:
+            return df
+
+        print("Encoding categorical features...")
+
+        # Apply one-hot encoding to categorical features
+        df_encoded = pd.get_dummies(df, columns=feature_types['categorical'], drop_first=True)
+
+        print(f"  Expanded {len(feature_types['categorical'])} categorical features to "
+              f"{df_encoded.shape[1] - (df.shape[1] - len(feature_types['categorical']))} binary features")
+
+        return df_encoded
+
+    def handle_class_imbalance(self, X, y):
+        """
+        Apply SMOTE to handle class imbalance.
+
+        Parameters:
+        -----------
+        X : pandas DataFrame
+            Feature data
+        y : pandas Series
+            Target labels
+
+        Returns:
+        --------
+        X_resampled, y_resampled : tuple
+            Resampled features and labels
+        """
+        print("Handling class imbalance using SMOTE...")
+
+        # Count original class distribution
+        class_counts = pd.Series(y).value_counts()
+        print(f"  Original class distribution: {class_counts.to_dict()}")
+
+        # Apply SMOTE
+        smote = SMOTE(random_state=42)
+        X_resampled, y_resampled = smote.fit_resample(X, y)
+
+        # Count new class distribution
+        new_class_counts = pd.Series(y_resampled).value_counts()
+        print(f"  New class distribution: {new_class_counts.to_dict()}")
+
+        return X_resampled, y_resampled
+
+    def prepare_data(self, df, target_column, apply_smote=True):
+        """
+        Full preprocessing pipeline for the dataset.
+
+        Parameters:
+        -----------
+        df : pandas DataFrame
+            The input data
+        target_column : str
+            Name of the target column
+        apply_smote : bool, default=True
+            Whether to apply SMOTE for class imbalance
+
+        Returns:
+        --------
+        X_train, X_test, y_train, y_test : tuple
+            Preprocessed training and testing data
+        """
+        print(f"\nPreparing {self.dataset_type} dataset with {df.shape[0]} samples and {df.shape[1]} features...")
+
+        # Separate features and target
+        X = df.drop(target_column, axis=1)
+        y = df[target_column]
+
+        # Identify feature types
+        feature_types = self.identify_feature_types(X)
+        print(f"  Found {len(feature_types['numerical'])} numerical and {len(feature_types['categorical'])} categorical features")
+        print(f"  Among numerical features: {len(feature_types['normal'])} normal and {len(feature_types['skewed'])} skewed")
+
+        # Handle missing values
+        X = self.handle_missing_values(X, feature_types)
+
+        # Encode categorical features
+        X = self.encode_categorical(X, feature_types)
+
+        # Split into training and testing sets before normalization to prevent data leakage
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42, stratify=y)
+
+        print(f"  Split into {X_train.shape[0]} training and {X_test.shape[0]} testing samples")
+
+        # Normalize features
+        X_train = self.normalize_features(X_train, feature_types, fit=True)
+        X_test = self.normalize_features(X_test, feature_types, fit=False)
+
+        # Handle class imbalance using SMOTE (only on training data)
+        if apply_smote:
+            X_train, y_train = self.handle_class_imbalance(X_train, y_train)
+
+        return X_train, X_test, y_train, y_test
+
+    def save_to_csv(self, X_train, X_test, y_train, y_test, output_dir='./preprocessed_data'):
+        """
+        Save the preprocessed data to CSV files.
+
+        Parameters:
+        -----------
+        X_train : pandas DataFrame
+            Training features
+        X_test : pandas DataFrame
+            Testing features
+        y_train : pandas Series
+            Training labels
+        y_test : pandas Series
+            Testing labels
+        output_dir : str, default='./preprocessed_data'
+            Directory to save the CSV files
+
+        Returns:
+        --------
+        file_paths : dict
+            Dictionary with paths to the saved CSV files
+        """
+        print(f"\nSaving preprocessed {self.dataset_type} data to CSV files...")
+
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Create dataset-specific subdirectory
+        dataset_dir = os.path.join(output_dir, self.dataset_type)
+        os.makedirs(dataset_dir, exist_ok=True)
+
+        # Generate file paths
+        train_file = os.path.join(dataset_dir, f"{self.dataset_type}_train.csv")
+        test_file = os.path.join(dataset_dir, f"{self.dataset_type}_test.csv")
+
+        # Combine features and labels
+        train_df = X_train.copy()
+        train_df['label'] = y_train
+
+        test_df = X_test.copy()
+        test_df['label'] = y_test
+
+        # Save to CSV
+        train_df.to_csv(train_file, index=False)
+        test_df.to_csv(test_file, index=False)
+
+        print(f"  Training data saved to: {train_file}")
+        print(f"  Testing data saved to: {test_file}")
+
+        return {
+            'train': train_file,
+            'test': test_file
+        }
+
+
+def preprocess_and_save(dataset_type, input_file, target_column, output_dir='./preprocessed_data', apply_smote=True):
+    """
+    Complete function to preprocess and save a dataset.
+
+    Parameters:
+    -----------
+    dataset_type : str
+        Type of dataset ('kddcup99', 'unsw-nb15', or 'ciciov2024')
+    input_file : str
+        Path to the input data file
+    target_column : str
+        Name of the target column
+    output_dir : str, default='./preprocessed_data'
+        Directory to save the CSV files
+    apply_smote : bool, default=True
+        Whether to apply SMOTE for class imbalance
+
+    Returns:
+    --------
+    file_paths : dict
+        Dictionary with paths to the saved CSV files
+    """
+    # Initialize preprocessor
+    preprocessor = DataPreprocessor(dataset_type)
+
+    # Load data
+    data = preprocessor.load_data(input_file)
+
+    # Preprocess data
+    X_train, X_test, y_train, y_test = preprocessor.prepare_data(data, target_column, apply_smote)
+
+    # Save to CSV
+    file_paths = preprocessor.save_to_csv(X_train, X_test, y_train, y_test, output_dir)
+
+    return file_paths
+
+
+# Example usage for each dataset type
+if __name__ == "__main__":
+    # Set output directory
+    output_dir = './preprocessed_data'
+
+    # Example for KDDCup99
+    kdd_paths = preprocess_and_save(
+        dataset_type='kddcup99',
+        input_file='[vtc conf] kddcup v1.csv',
+        target_column='label',
+        output_dir=output_dir
+    )
+
+    # Example for UNSW-NB15
+    unsw_paths = preprocess_and_save(
+        dataset_type='unsw-nb15',
+        input_file='[vtc conf] UNSW_NB15_training-set.csv',
+        target_column='label',
+        output_dir=output_dir
+    )
+
+    # Example for CICIoV2024
+    ciciov_paths = preprocess_and_save(
+        dataset_type='ciciov2024',
+        input_file='[vtc conf] Normal+Attack Data.csv',
+        target_column='label',
+        output_dir=output_dir
+    )
+
+    print("\nAll preprocessing completed successfully!")
+    print(f"Preprocessed data saved to {output_dir}")
